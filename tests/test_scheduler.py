@@ -75,9 +75,13 @@ class SchedulerTests(unittest.TestCase):
                 "calculated_finish": "2026-09-07T17:00",
             },
         ]
-        task_ids, relations = critical_path(tasks, [])
+        driving_relations: set[tuple[int, int, str]] = set()
+        task_ids, relations = critical_path(
+            tasks, [], driving_relations_out=driving_relations
+        )
         self.assertEqual(task_ids, {1, 2, 10})
         self.assertEqual(relations, set())
+        self.assertEqual(driving_relations, {(1, 2, "resource")})
 
     def test_critical_path_excludes_resource_predecessor_with_real_float(self) -> None:
         workface = {
@@ -105,8 +109,51 @@ class SchedulerTests(unittest.TestCase):
                 "calculated_finish": "2026-09-09T17:00",
             },
         ]
-        task_ids, _ = critical_path(tasks, [])
+        driving_relations: set[tuple[int, int, str]] = set()
+        task_ids, _ = critical_path(
+            tasks, [], driving_relations_out=driving_relations
+        )
         self.assertEqual(task_ids, {2})
+        self.assertEqual(driving_relations, set())
+
+    def test_critical_path_reports_resource_activation_as_driving_relation(self) -> None:
+        activation = {
+            "id": 1,
+            "name": "作业面移交",
+            "parent_id": None,
+            "duration": 0,
+            "task_type": "milestone",
+            "calculated_start": "2026-09-07T08:00",
+            "calculated_finish": "2026-09-07T08:00",
+        }
+        workface = {
+            "id": 20,
+            "name": "一层A区",
+            "resource_type": "workface",
+            "capacity": 1,
+            "enabled": 1,
+            "activation_event_id": 1,
+        }
+        task = {
+            "id": 2,
+            "name": "墙体砌筑",
+            "parent_id": None,
+            "duration": 1,
+            "resources": [workface],
+            "calculated_start": "2026-09-07T08:00",
+            "calculated_finish": "2026-09-07T17:00",
+        }
+        driving_relations: set[tuple[int, int, str]] = set()
+
+        task_ids, relations = critical_path(
+            [activation, task],
+            [],
+            driving_relations_out=driving_relations,
+        )
+
+        self.assertEqual(task_ids, {1, 2})
+        self.assertEqual(relations, set())
+        self.assertEqual(driving_relations, {(1, 2, "availability")})
 
     def test_constraint_can_break_critical_predecessor_chain(self) -> None:
         tasks = [
@@ -1421,6 +1468,7 @@ class DatabaseTests(unittest.TestCase):
     def test_unavailable_route_uses_configured_alternative(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "schedule.db")
+            database.update_settings("测试计划", "2026-09-07")
             a = database.add_path_node("A")
             b = database.add_path_node("B")
             primary_segment = database.add_path_segment(
@@ -1479,6 +1527,73 @@ class DatabaseTests(unittest.TestCase):
             )
             database.save_calculated_dates(result, reasons, assignments)
             self.assertEqual(database.task(task_id)["assigned_crew"]["id"], crew)
+
+    def test_schedule_runs_preserve_results_and_can_be_selected(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "schedule.db")
+            task_id = database.add_task("主体施工", 1, None, None, "")
+            first_id = database.save_calculated_dates(
+                {task_id: ("2026-09-07T08:00", "2026-09-07T17:00")},
+                {task_id: "原计划"},
+                name="方案 A",
+                status_date="2026-09-06",
+                optimization_goal="stable",
+            )
+            second_id = database.save_calculated_dates(
+                {task_id: ("2026-09-10T08:00", "2026-09-10T17:00")},
+                {task_id: "当前预测"},
+                name="方案 B",
+                status_date="2026-09-09",
+                optimization_goal="fastest",
+            )
+
+            self.assertEqual(database.current_schedule_run_id(), second_id)
+            self.assertEqual(database.task(task_id)["calculated_start"], "2026-09-10T08:00")
+            self.assertEqual(
+                database.task(task_id, first_id)["calculated_start"],
+                "2026-09-07T08:00",
+            )
+            database.set_current_schedule_run(first_id)
+            self.assertEqual(database.task(task_id)["schedule_reason"], "原计划")
+            runs = {run["id"]: run for run in database.schedule_runs()}
+            self.assertEqual(runs[first_id]["name"], "方案 A")
+            self.assertEqual(runs[second_id]["result_count"], 1)
+
+    def test_legacy_task_schedule_columns_are_migrated_then_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "old_schedule.db"
+            database = Database(path)
+            task_id = database.add_task("迁移任务", 1, None, None, "")
+            with database.session() as connection:
+                connection.execute("ALTER TABLE tasks ADD COLUMN calculated_start TEXT")
+                connection.execute("ALTER TABLE tasks ADD COLUMN calculated_finish TEXT")
+                connection.execute("ALTER TABLE tasks ADD COLUMN calculated_crew_id INTEGER")
+                connection.execute(
+                    "ALTER TABLE tasks ADD COLUMN schedule_reason TEXT NOT NULL DEFAULT ''"
+                )
+                connection.execute(
+                    """UPDATE tasks SET calculated_start = '2026-09-07T08:00',
+                           calculated_finish = '2026-09-07T17:00',
+                           schedule_reason = '旧版结果'
+                       WHERE id = ?""",
+                    (task_id,),
+                )
+
+            migrated = Database(path)
+            with migrated.session() as connection:
+                columns = {
+                    row[1] for row in connection.execute("PRAGMA table_info(tasks)")
+                }
+            self.assertTrue(
+                {
+                    "calculated_start",
+                    "calculated_finish",
+                    "calculated_crew_id",
+                    "schedule_reason",
+                }.isdisjoint(columns)
+            )
+            self.assertEqual(migrated.schedule_runs()[0]["name"], "迁移前当前计划")
+            self.assertEqual(migrated.task(task_id)["schedule_reason"], "旧版结果")
 
     def test_crud_and_dependency_cascade(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

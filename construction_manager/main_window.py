@@ -38,8 +38,11 @@ from .dialogs import (
     WorkCalendarDialog,
 )
 from .gantt import GanttWidget
+from .time_scaled_network import TimeScaledNetworkWidget
 from .icons import make_icon
-from .scheduler import ScheduleError, calculate_schedule_details, schedule_sort_key
+from .domain import ScheduleModel
+from .scheduler import ScheduleError, schedule_sort_key
+from .scheduling import ScheduleOptions, SchedulingEngine
 from .work_calendar import WorkCalendar
 from .trades import normalized_trade
 from .task_tree import DraggableTaskTree
@@ -370,10 +373,63 @@ class MainWindow(QMainWindow):
         self.trade_legend.setWordWrap(True)
         gantt_layout.addWidget(self.trade_legend)
         gantt_layout.addWidget(self.gantt, 1)
+
+        self.time_network = TimeScaledNetworkWidget()
+        network_controls = QHBoxLayout()
+        network_controls.setContentsMargins(0, 0, 0, 0)
+        network_controls.addWidget(QLabel("时标网络图显示"))
+        self.network_critical_toggle = QCheckBox("突出关键路径")
+        self.network_critical_toggle.setChecked(True)
+        self.network_critical_toggle.setToolTip("关键活动和控制性工序关系以红色粗线显示")
+        self.network_critical_toggle.toggled.connect(
+            self.time_network.set_show_critical_path
+        )
+        network_controls.addWidget(self.network_critical_toggle)
+        export_network = QPushButton("导出完整时标网络图")
+        export_network.clicked.connect(self.export_time_network_image)
+        self._decorate_button(
+            export_network,
+            "export",
+            "导出包含全部活动、时间刻度、逻辑关系和关键路径的 PNG 图片",
+            icon_only=False,
+        )
+        network_controls.addWidget(export_network)
+        network_controls.addStretch()
+        network_controls.addWidget(QLabel("横向缩放"))
+        network_controls.addWidget(QLabel("缩小"))
+        self.network_zoom = QSlider(Qt.Orientation.Horizontal)
+        self.network_zoom.setRange(12, 240)
+        self.network_zoom.setValue(84)
+        self.network_zoom.setFixedWidth(240)
+        self.network_zoom.setToolTip("缩放时间轴；图中所有活动端点始终对应实际日期和时间")
+        self.network_zoom.valueChanged.connect(self.time_network.set_day_width)
+        self.time_network.day_width_changed.connect(
+            lambda width: self.network_zoom.setValue(round(width))
+        )
+        network_controls.addWidget(self.network_zoom)
+        network_controls.addWidget(QLabel("放大"))
+
+        network_panel = QWidget()
+        network_layout = QVBoxLayout(network_panel)
+        network_layout.setContentsMargins(0, 0, 0, 0)
+        network_layout.setSpacing(6)
+        network_layout.addLayout(network_controls)
+        network_legend = QLabel(
+            '<span style="color:#2374AB;">▰</span> 普通活动节点　'
+            '<span style="color:#657985;">┄┄▶</span> 逻辑关系（标注 FS/SS/FF/SF 与时距）　'
+            '<span style="color:#D32F2F;">▰ ━▶</span> 连续关键控制链（含资源/开放事件）　'
+            '<span style="color:#f4f6f7; background:#9aa5ab;"> 非工作日 </span>'
+        )
+        network_legend.setStyleSheet("color: #52616b; padding-left: 4px;")
+        network_legend.setWordWrap(True)
+        network_layout.addWidget(network_legend)
+        network_layout.addWidget(self.time_network, 1)
+
         content_tabs = QTabWidget()
         content_tabs.setDocumentMode(True)
         content_tabs.addTab(tree_panel, "任务表")
         content_tabs.addTab(gantt_panel, "横道图")
+        content_tabs.addTab(network_panel, "时标网络图")
         content_tabs.setToolTip("在任务明细表和横道图之间切换")
         self.content_tabs = content_tabs
 
@@ -423,6 +479,31 @@ class MainWindow(QMainWindow):
             f"完整横道图已导出到：\n{output}\n\n图片尺寸：{width} × {height} 像素",
         )
         self.statusBar().showMessage(f"完整横道图图片已导出：{output}", 6000)
+
+    def export_time_network_image(self) -> None:
+        default_name = "计划_时标网络图.png"
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "导出完整时标网络图",
+            str(Path.home() / "Desktop" / default_name),
+            "PNG 图片 (*.png)",
+        )
+        if not path:
+            return
+        if not path.lower().endswith(".png"):
+            path += ".png"
+        try:
+            output = self.time_network.export_full_image(path)
+        except (OSError, ValueError) as error:
+            QMessageBox.warning(self, "导出失败", str(error))
+            return
+        width, height = self.time_network.full_content_size()
+        QMessageBox.information(
+            self,
+            "导出完成",
+            f"完整时标网络图已导出到：\n{output}\n\n图片尺寸：{width} × {height} 像素",
+        )
+        self.statusBar().showMessage(f"完整时标网络图已导出：{output}", 6000)
 
     def _update_task_action_state(self) -> None:
         enabled = self.selected_task_id() is not None
@@ -824,29 +905,33 @@ class MainWindow(QMainWindow):
         dependencies = self.database.dependencies()
         start = str(self.project_settings["project_start"])
         calendar = self._work_calendar()
-        crew_assignments: dict[int, int] = {}
-        calculated, reasons = calculate_schedule_details(
-            tasks,
-            dependencies,
-            start,
-            calendar,
-            available_resources=self.database.resources(),
-            crew_assignments_out=crew_assignments,
-            optimization_goal=str(
-                self.project_settings.get("optimization_goal", "stable")
+        result = SchedulingEngine.calculate(
+            ScheduleModel(
+                tasks=tasks,
+                dependencies=dependencies,
+                project_start=start,
+                calendar=calendar,
+                available_resources=self.database.resources(),
             ),
-            status_date=self.project_settings.get("status_date"),
-            crew_max_daily_hours=float(
-                self.project_settings.get("crew_max_daily_hours", 8)
-            ),
-            crew_max_consecutive_days=int(
-                self.project_settings.get("crew_max_consecutive_days", 0)
-            ),
-            resource_leveling_mode=str(
-                self.project_settings.get("resource_leveling_mode", "delay")
+            ScheduleOptions(
+                optimization_goal=str(
+                    self.project_settings.get("optimization_goal", "stable")
+                ),
+                status_date=self.project_settings.get("status_date"),
+                crew_max_daily_hours=float(
+                    self.project_settings.get("crew_max_daily_hours", 8)
+                ),
+                crew_max_consecutive_days=int(
+                    self.project_settings.get("crew_max_consecutive_days", 0)
+                ),
+                resource_leveling_mode=str(
+                    self.project_settings.get("resource_leveling_mode", "delay")
+                ),
             ),
         )
-        self.database.save_calculated_dates(calculated, reasons, crew_assignments)
+        self.database.save_calculated_dates(
+            result.dates, result.reasons, result.crew_assignments
+        )
 
     def recalculate(self, show_success: bool = False) -> None:
         try:
@@ -1030,6 +1115,15 @@ class MainWindow(QMainWindow):
                 self.project_settings.get("crew_max_consecutive_days", 0)
             ),
             trade_colors=trade_colors,
+        )
+        self.time_network.set_data(
+            tasks,
+            dependencies,
+            start,
+            calendar,
+            crew_max_daily_hours=float(
+                self.project_settings.get("crew_max_daily_hours", 8)
+            ),
         )
         self._update_project_finish_display(tasks)
         self._update_deadline_status(tasks)

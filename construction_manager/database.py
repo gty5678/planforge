@@ -131,10 +131,6 @@ class Database:
             calendar_type TEXT NOT NULL DEFAULT 'working',
             priority INTEGER NOT NULL DEFAULT 50,
             constraint_start TEXT,
-            calculated_start TEXT,
-            calculated_finish TEXT,
-            calculated_crew_id INTEGER,
-            schedule_reason TEXT NOT NULL DEFAULT '',
             sort_order INTEGER NOT NULL DEFAULT 0,
             notes TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -273,10 +269,38 @@ class Database:
             UNIQUE (route_id, sort_order)
         );
 
+        CREATE TABLE IF NOT EXISTS schedule_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            status_date TEXT,
+            optimization_goal TEXT NOT NULL,
+            name TEXT NOT NULL,
+            is_current INTEGER NOT NULL DEFAULT 0 CHECK (is_current IN (0, 1))
+        );
+
+        CREATE TABLE IF NOT EXISTS task_schedule_results (
+            run_id INTEGER NOT NULL,
+            task_id INTEGER NOT NULL,
+            start TEXT,
+            finish TEXT,
+            crew_id INTEGER,
+            total_float REAL,
+            free_float REAL,
+            reason_code TEXT NOT NULL DEFAULT '',
+            PRIMARY KEY (run_id, task_id),
+            FOREIGN KEY (run_id) REFERENCES schedule_runs(id) ON DELETE CASCADE,
+            FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+            FOREIGN KEY (crew_id) REFERENCES resources(id) ON DELETE SET NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_id);
         CREATE INDEX IF NOT EXISTS idx_dependencies_successor ON dependencies(successor_id);
         CREATE INDEX IF NOT EXISTS idx_task_resources_resource
             ON task_resource_demands(resource_id);
+        CREATE INDEX IF NOT EXISTS idx_task_schedule_results_task
+            ON task_schedule_results(task_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_schedule_runs_current
+            ON schedule_runs(is_current) WHERE is_current = 1;
         """
         with self.session() as connection:
             connection.executescript(schema)
@@ -321,8 +345,6 @@ class Database:
                 "task_type": "ALTER TABLE tasks ADD COLUMN task_type TEXT NOT NULL DEFAULT 'work'",
                 "calendar_type": "ALTER TABLE tasks ADD COLUMN calendar_type TEXT NOT NULL DEFAULT 'working'",
                 "priority": "ALTER TABLE tasks ADD COLUMN priority INTEGER NOT NULL DEFAULT 50",
-                "schedule_reason": "ALTER TABLE tasks ADD COLUMN schedule_reason TEXT NOT NULL DEFAULT ''",
-                "calculated_crew_id": "ALTER TABLE tasks ADD COLUMN calculated_crew_id INTEGER",
                 "event_status": "ALTER TABLE tasks ADD COLUMN event_status TEXT NOT NULL DEFAULT 'derived'",
                 "event_time": "ALTER TABLE tasks ADD COLUMN event_time TEXT",
                 "has_noise": "ALTER TABLE tasks ADD COLUMN has_noise INTEGER NOT NULL DEFAULT 0",
@@ -430,6 +452,7 @@ class Database:
                 "INSERT OR IGNORE INTO schedule_settings(id, project_start) VALUES(1, ?)",
                 (date.today().isoformat(),),
             )
+            self._migrate_legacy_schedule_results(connection, task_columns)
             if not connection.execute(
                 "SELECT 1 FROM trade_definitions LIMIT 1"
             ).fetchone():
@@ -465,6 +488,72 @@ class Database:
                    )"""
             )
             self._remove_legacy_internal_segment_dependencies(connection)
+
+    @staticmethod
+    def _migrate_legacy_schedule_results(
+        connection: sqlite3.Connection, task_columns: set[str]
+    ) -> None:
+        """Move the former task-owned calculation fields into one versioned run."""
+        legacy_columns = {
+            "calculated_start",
+            "calculated_finish",
+            "calculated_crew_id",
+            "schedule_reason",
+        }
+        present = legacy_columns & task_columns
+        if present and not connection.execute(
+            "SELECT 1 FROM schedule_runs LIMIT 1"
+        ).fetchone():
+            predicates = [
+                f"{column} IS NOT NULL"
+                for column in ("calculated_start", "calculated_finish", "calculated_crew_id")
+                if column in present
+            ]
+            if "schedule_reason" in present:
+                predicates.append("schedule_reason <> ''")
+            has_legacy_results = bool(
+                predicates
+                and connection.execute(
+                    f"SELECT 1 FROM tasks WHERE {' OR '.join(predicates)} LIMIT 1"
+                ).fetchone()
+            )
+            if has_legacy_results:
+                settings = connection.execute(
+                    """SELECT status_date, optimization_goal
+                       FROM schedule_settings WHERE id = 1"""
+                ).fetchone()
+                cursor = connection.execute(
+                    """INSERT INTO schedule_runs
+                       (status_date, optimization_goal, name, is_current)
+                       VALUES (?, ?, '迁移前当前计划', 1)""",
+                    (
+                        settings["status_date"] if settings else None,
+                        settings["optimization_goal"] if settings else "stable",
+                    ),
+                )
+                run_id = int(cursor.lastrowid)
+                start = "calculated_start" if "calculated_start" in present else "NULL"
+                finish = "calculated_finish" if "calculated_finish" in present else "NULL"
+                crew = "calculated_crew_id" if "calculated_crew_id" in present else "NULL"
+                reason = "schedule_reason" if "schedule_reason" in present else "''"
+                connection.execute(
+                    f"""INSERT INTO task_schedule_results
+                        (run_id, task_id, start, finish, crew_id, reason_code)
+                        SELECT ?, id, {start}, {finish}, {crew}, {reason}
+                        FROM tasks WHERE {' OR '.join(predicates)}""",
+                    (run_id,),
+                )
+
+        # These columns are derived output, never task input. Removing them makes
+        # accidental writes back to tasks impossible after the migration.
+        for column in (
+            "calculated_start",
+            "calculated_finish",
+            "calculated_crew_id",
+            "schedule_reason",
+        ):
+            if column in present:
+                connection.execute(f"ALTER TABLE tasks DROP COLUMN {column}")
 
     def trades(self) -> list[dict]:
         with self.session() as connection:
@@ -1197,10 +1286,11 @@ class Database:
                 ),
             )
 
-    def tasks(self) -> list[dict]:
+    def tasks(self, schedule_run_id: int | None = None) -> list[dict]:
         with self.session() as connection:
             rows = connection.execute("SELECT * FROM tasks ORDER BY sort_order, id").fetchall()
             items = [self._task_dict(row) for row in rows]
+            self._attach_schedule_results(connection, items, schedule_run_id)
             self._attach_process_templates(connection, items)
             self._attach_resources(connection, items)
             children: dict[int, list[dict]] = {}
@@ -1216,12 +1306,13 @@ class Database:
                     )
             return items
 
-    def task(self, task_id: int) -> dict | None:
+    def task(self, task_id: int, schedule_run_id: int | None = None) -> dict | None:
         with self.session() as connection:
             row = connection.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if row is None:
                 return None
             item = self._task_dict(row)
+            self._attach_schedule_results(connection, [item], schedule_run_id)
             self._attach_process_templates(connection, [item])
             self._attach_resources(connection, [item])
             children = connection.execute(
@@ -1249,6 +1340,55 @@ class Database:
         item.setdefault("resources", [])
         item.setdefault("process_name", "")
         return item
+
+    @staticmethod
+    def _attach_schedule_results(
+        connection: sqlite3.Connection,
+        tasks: list[dict],
+        schedule_run_id: int | None = None,
+    ) -> None:
+        """Project one selected run onto the legacy task-dictionary read contract."""
+        for task in tasks:
+            task["schedule_run_id"] = None
+            task["calculated_start"] = None
+            task["calculated_finish"] = None
+            task["calculated_crew_id"] = None
+            task["schedule_reason"] = ""
+            task["total_float"] = None
+            task["free_float"] = None
+        if not tasks:
+            return
+        if schedule_run_id is None:
+            current = connection.execute(
+                "SELECT id FROM schedule_runs WHERE is_current = 1"
+            ).fetchone()
+            if current is None:
+                return
+            schedule_run_id = int(current["id"])
+        elif not connection.execute(
+            "SELECT 1 FROM schedule_runs WHERE id = ?", (int(schedule_run_id),)
+        ).fetchone():
+            raise ValueError("排程版本不存在。")
+
+        task_by_id = {int(task["id"]): task for task in tasks}
+        for task in tasks:
+            task["schedule_run_id"] = int(schedule_run_id)
+        placeholders = ",".join("?" for _ in task_by_id)
+        rows = connection.execute(
+            f"""SELECT task_id, start, finish, crew_id, total_float,
+                       free_float, reason_code
+                FROM task_schedule_results
+                WHERE run_id = ? AND task_id IN ({placeholders})""",
+            (int(schedule_run_id), *task_by_id),
+        ).fetchall()
+        for row in rows:
+            task = task_by_id[int(row["task_id"])]
+            task["calculated_start"] = row["start"]
+            task["calculated_finish"] = row["finish"]
+            task["calculated_crew_id"] = row["crew_id"]
+            task["schedule_reason"] = str(row["reason_code"] or "")
+            task["total_float"] = row["total_float"]
+            task["free_float"] = row["free_float"]
 
     @staticmethod
     def _attach_process_templates(
@@ -1823,6 +1963,7 @@ class Database:
                    ORDER BY t.sort_order, t.id"""
             ).fetchall()
             items = [self._task_dict(row) for row in rows]
+            self._attach_schedule_results(connection, items)
             self._attach_process_templates(connection, items)
             self._attach_resources(connection, items)
             return items
@@ -1834,6 +1975,7 @@ class Database:
                 (parent_id,),
             ).fetchall()
             items = [self._task_dict(row) for row in rows]
+            self._attach_schedule_results(connection, items)
             self._attach_process_templates(connection, items)
             self._attach_resources(connection, items)
             return items
@@ -2253,32 +2395,103 @@ class Database:
         values: dict[int, tuple[str, str]],
         reasons: dict[int, str] | None = None,
         crew_assignments: dict[int, int] | None = None,
-    ) -> None:
+        *,
+        name: str | None = None,
+        status_date: str | None = None,
+        optimization_goal: str | None = None,
+        total_floats: dict[int, float] | None = None,
+        free_floats: dict[int, float] | None = None,
+    ) -> int:
+        """Persist an immutable schedule version and make it the current view."""
         with self.session() as connection:
+            settings = connection.execute(
+                """SELECT status_date, optimization_goal
+                   FROM schedule_settings WHERE id = 1"""
+            ).fetchone()
+            effective_status_date = (
+                status_date if status_date is not None else settings["status_date"]
+            )
+            effective_goal = str(
+                optimization_goal
+                if optimization_goal is not None
+                else settings["optimization_goal"]
+            )
+            run_name = (name or f"排程 {datetime.now():%Y-%m-%d %H:%M:%S}").strip()
+            if not run_name:
+                raise ValueError("排程版本名称不能为空。")
             connection.execute(
-                """UPDATE tasks
-                   SET calculated_start = NULL, calculated_finish = NULL,
-                       calculated_crew_id = NULL"""
+                "UPDATE schedule_runs SET is_current = 0 WHERE is_current = 1"
             )
-            connection.executemany(
-                """UPDATE tasks SET calculated_start = ?, calculated_finish = ?
-                   WHERE id = ?""",
-                [(start, finish, task_id) for task_id, (start, finish) in values.items()],
+            cursor = connection.execute(
+                """INSERT INTO schedule_runs
+                   (status_date, optimization_goal, name, is_current)
+                   VALUES (?, ?, ?, 1)""",
+                (effective_status_date, effective_goal, run_name),
             )
-            if reasons is not None:
-                connection.execute("UPDATE tasks SET schedule_reason = ''")
+            run_id = int(cursor.lastrowid)
+            reasons = reasons or {}
+            crew_assignments = crew_assignments or {}
+            total_floats = total_floats or {}
+            free_floats = free_floats or {}
+            result_task_ids = sorted(
+                set(values)
+                | set(reasons)
+                | set(crew_assignments)
+                | set(total_floats)
+                | set(free_floats)
+            )
+            if result_task_ids:
                 connection.executemany(
-                    "UPDATE tasks SET schedule_reason = ? WHERE id = ?",
-                    [(reason, task_id) for task_id, reason in reasons.items()],
-                )
-            if crew_assignments:
-                connection.executemany(
-                    "UPDATE tasks SET calculated_crew_id = ? WHERE id = ?",
+                    """INSERT INTO task_schedule_results
+                       (run_id, task_id, start, finish, crew_id, total_float,
+                        free_float, reason_code)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                     [
-                        (crew_id, task_id)
-                        for task_id, crew_id in crew_assignments.items()
+                        (
+                            run_id,
+                            task_id,
+                            values.get(task_id, (None, None))[0],
+                            values.get(task_id, (None, None))[1],
+                            crew_assignments.get(task_id),
+                            total_floats.get(task_id),
+                            free_floats.get(task_id),
+                            reasons.get(task_id, ""),
+                        )
+                        for task_id in result_task_ids
                     ],
                 )
+            return run_id
+
+    def schedule_runs(self) -> list[dict]:
+        with self.session() as connection:
+            rows = connection.execute(
+                """SELECT sr.*, COUNT(tsr.task_id) AS result_count
+                   FROM schedule_runs sr
+                   LEFT JOIN task_schedule_results tsr ON tsr.run_id = sr.id
+                   GROUP BY sr.id
+                   ORDER BY sr.created_at DESC, sr.id DESC"""
+            ).fetchall()
+            return [dict(row) for row in rows]
+
+    def current_schedule_run_id(self) -> int | None:
+        with self.session() as connection:
+            row = connection.execute(
+                "SELECT id FROM schedule_runs WHERE is_current = 1"
+            ).fetchone()
+            return int(row["id"]) if row else None
+
+    def set_current_schedule_run(self, run_id: int) -> None:
+        with self.session() as connection:
+            if not connection.execute(
+                "SELECT 1 FROM schedule_runs WHERE id = ?", (int(run_id),)
+            ).fetchone():
+                raise ValueError("排程版本不存在。")
+            connection.execute(
+                "UPDATE schedule_runs SET is_current = 0 WHERE is_current = 1"
+            )
+            connection.execute(
+                "UPDATE schedule_runs SET is_current = 1 WHERE id = ?", (int(run_id),)
+            )
 
     def resources(self, resource_type: str | None = None) -> list[dict]:
         with self.session() as connection:
@@ -2471,7 +2684,7 @@ class Database:
     def delete_resource(self, resource_id: int) -> None:
         with self.session() as connection:
             connection.execute(
-                "UPDATE tasks SET calculated_crew_id = NULL WHERE calculated_crew_id = ?",
+                "UPDATE task_schedule_results SET crew_id = NULL WHERE crew_id = ?",
                 (resource_id,),
             )
             connection.execute("DELETE FROM resources WHERE id = ?", (resource_id,))
@@ -2974,13 +3187,17 @@ class Database:
                 if event_id is None:
                     return None
                 row = connection.execute(
-                    """SELECT event_status, event_time, calculated_finish
-                       FROM tasks WHERE id = ?""",
+                    """SELECT t.event_status, t.event_time, tsr.finish
+                       FROM tasks t
+                       LEFT JOIN schedule_runs sr ON sr.is_current = 1
+                       LEFT JOIN task_schedule_results tsr
+                         ON tsr.run_id = sr.id AND tsr.task_id = t.id
+                       WHERE t.id = ?""",
                     (int(event_id),),
                 ).fetchone()
                 if row is None or row["event_status"] == "pending":
                     return None
-                raw = row["event_time"] or row["calculated_finish"]
+                raw = row["event_time"] or row["finish"]
                 return datetime.fromisoformat(raw).date() if raw else None
 
             def route_available(candidate_steps) -> bool:
