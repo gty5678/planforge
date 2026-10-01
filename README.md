@@ -1,13 +1,13 @@
-# 工程计划横道图
-
-<p align="center">
-  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.13-3776AB?style=for-the-badge&amp;logo=python&amp;logoColor=white" alt="Python 3.13"></a>
-  <a href="https://doc.qt.io/qtforpython-6/"><img src="https://img.shields.io/badge/PySide6-6.7%2B-41CD52?style=for-the-badge&amp;logo=qt&amp;logoColor=white" alt="PySide6 6.7+"></a>
-  <a href="https://www.sqlite.org/"><img src="https://img.shields.io/badge/SQLite-3-003B57?style=for-the-badge&amp;logo=sqlite&amp;logoColor=white" alt="SQLite"></a>
-  <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/managed%20with-uv-DE5FE9?style=for-the-badge&amp;logo=uv&amp;logoColor=white" alt="managed with uv"></a>
-</p>
-
-基于 Python 3.13、PySide6 和 SQLite 的单机进度计划软件。
+<div align="center">
+  <h1>工程计划横道图</h1>
+  <p>基于 Python 3.13、PySide6 和 SQLite 的单机进度计划软件。</p>
+  <p>
+    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.13-3776AB?style=flat-square" alt="Python 3.13"></a>
+    <a href="https://doc.qt.io/qtforpython-6/"><img src="https://img.shields.io/badge/PySide6-6.7%2B-41CD52?style=flat-square" alt="PySide6 6.7+"></a>
+    <a href="https://www.sqlite.org/"><img src="https://img.shields.io/badge/SQLite-3-003B57?style=flat-square" alt="SQLite"></a>
+    <a href="https://docs.astral.sh/uv/"><img src="https://img.shields.io/badge/uv-managed-DE5FE9?style=flat-square" alt="uv managed"></a>
+  </p>
+</div>
 
 ## 当前最小范围
 
